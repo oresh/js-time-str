@@ -18,76 +18,151 @@ export function parse(input) {
 
 class parser {
 	constructor(ast) {
-		// internal ast will be mutated
-		this.ast = [].concat(ast)
+		this.ast = ast
 		this.pos = 0 // current position in ast
-
-		this.hours = 0
-		this.mins = 0
-		this.exact = false
+		this.invert = false // hours<>minutes inverted form
+		this.hcorrection = 0 // hours are adjusted by this number, used for '15 минут шестого'
+		this.err = null // last error
+		this.numbers = [] // numbers in order of appearance
+		this.exact = false // is time exact or is not known is it AM/PM
 	}
 
 	result() {
-		let mins = this.mins + ''
+		let hours, mins
+
+		if (this.invert) {
+			hours = this.numbers[1] || 0
+			mins = this.numbers[0] || 0
+		} else {
+			hours = this.numbers[0] || 0
+			mins = this.numbers[1] || 0
+		}
+
+		hours += this.hcorrection
+
 		if (mins.length < 2) {
 			// add leading zero
 			mins = '0' + mins
 		}
-		return { s: this.hours + '.' + mins, exact: this.exact }
+
+		return { s: hours + '.' + mins, exact: this.exact }
 	}
 
 	run() {
-		// use simple strategy: first number is hours and second is minutes
-		let hset = false
+		for (let stateFn = stateBegin; stateFn; stateFn = stateFn(this));
+		return this.err
+	}
 
-		while (this.pos < this.ast.length) {
-			// todo: mutate, consume
+	consume(Type) {
+		for (; this.accepts(Type););
+	}
 
-			const tok = this.ast[this.pos]
+	accepts(Type, val) {
+		const tok = this.next()
+		if (tok.tt != Type || val !== undefined && tok.raw != val) {
+			this.backup()
+			return false
+		}
+		return true
+	}
 
+	number() {
+		let tok = this.next()
+		let sum = 0
+		let initialized = false
+		let val
 
-
-			let num
-			if (tok[0] == 'number') {
-				num = tok[1]
-			}
-
-
-			switch (tok[0]) {
-				case 'number':
-					num = tok[1]
+		loop:
+		for (; ;) {
+			switch (tok.tt) {
+				case tokenType.Number:
+					sum += Number(tok.raw)
+					initialized = true
 					break
-				case 'word':
-					if (numbers[tok[1]]) {
-						num = numbers[tok[1]].n
+
+				case tokenType.Word:
+					val = numericTable[tok.raw]
+					if (!val) {
+						this.backup()
+						break
+					}
+
+					sum += Number(val.n)
+					initialized = true
+
+					if (val.multipart) {
+						this.consume(tokenType.Blank)
+						tok = this.next()
+						continue loop
 					}
 					break
 			}
+			break
+		}
 
-			if (hset) {
-				this.mins = num
-			} else {
-				this.hours = num
-				hset = true
-			}
+		return initialized ? sum : null
+	}
 
-			this.pos++
+	next() {
+		if (this.ast.length <= this.pos) {
+			return null
+		}
+
+		const res = this.ast[this.pos]
+		this.pos++
+		return res
+	}
+
+	backup() {
+		this.pos--
+	}
+}
+
+
+const stateBegin = (p) => {
+	if (p.accepts(tokenType.Word, 'без')) {
+		p.invert = true
+		return stateBegin
+	}
+
+	const n = p.number()
+
+	if (n !== null) {
+		p.numbers.push(n)
+
+		if (p.accepts(tokenType.Blank, ':') || p.accepts(tokenType.Blank, '.')) {
+			return stateMinutes
 		}
 	}
+}
+
+const stateMinutes = (p) => {
+	const n = p.number()
+
+	if (n === null) {
+		p.err = new Error(`parse error: given ${p.next()}, want: numeric`)
+	}
+	p.numbers.push(n)
+}
+
+const tokenType = {
+	Blank: 'blank',
+	Number: 'number',
+	Word: 'word'
 }
 
 const lexRules = [
 	{
 		test: /^[:\. ]/,
-		emit: (m) => ['blank', m[0]]
+		emit: (m) => { return { tt: tokenType.Blank, raw: m[0] } }
 	},
 	{
 		test: /^\d+/,
-		emit: (m) => ['number', m[0]]
+		emit: (m) => { return { tt: tokenType.Number, raw: m[0] } }
 	},
 	{
 		test: /^[^\d :\.]+/,
-		emit: (m) => ['word', m[0]]
+		emit: (m) => { return { tt: tokenType.Word, raw: m[0] } }
 	}
 ]
 
@@ -114,7 +189,7 @@ function lex(input) {
 	return tok
 }
 
-const numbers = {}
+const numericTable = {}
 
 	;
 (() => {
@@ -145,6 +220,6 @@ const numbers = {}
 		{ n: 40, t: 'сороковая,сорок', multipart: true },
 		{ n: 50, t: 'пятидесятая,пятьдесят', multipart: true }
 	].forEach(({ n, t, multipart }) => {
-		t.split(',').forEach((tok) => numbers[tok] = { n, multipart })
+		t.split(',').forEach((tok) => numericTable[tok] = { n, multipart })
 	})
 })()
