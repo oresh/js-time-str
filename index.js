@@ -20,11 +20,11 @@ class parser {
 	constructor(ast) {
 		this.ast = ast
 		this.pos = 0 // current position in ast
-		this.invert = false // hours<>minutes inverted form
-		this.hcorrection = 0 // hours are adjusted by this number, used for '15 минут шестого'
 		this.err = null // last error
-		this.numbers = [] // numbers in order of appearance
-		this.exact = false // is time exact or is not known is it AM/PM
+
+		this.invert = false // hours<>minutes inverted form
+		this.neg = false // mins = 60 - num
+		this.numbers = []
 	}
 
 	result() {
@@ -33,14 +33,18 @@ class parser {
 		if (this.invert) {
 			hours = this.numbers[1] || 0
 			mins = this.numbers[0] || 0
+
+			hours -= 1
 		} else {
 			hours = this.numbers[0] || 0
 			mins = this.numbers[1] || 0
 		}
 
-		hours += this.hcorrection
+		if (this.neg) {
+			mins = 60 - mins
+		}
 
-		if (mins.length < 2) {
+		if (mins < 10) {
 			// add leading zero
 			mins = '0' + mins
 		}
@@ -49,16 +53,36 @@ class parser {
 	}
 
 	run() {
-		for (let stateFn = stateBegin; stateFn; stateFn = stateFn(this));
+		for (let stateFn = stateHead; stateFn; stateFn = stateFn(this));
+
+		if (this.pos < this.ast.length) {
+			this.err = new Error('parse error: input not consumed')
+		}
+
 		return this.err
 	}
 
-	consume(Type) {
-		for (; this.accepts(Type););
+	next() {
+		if (this.pos >= this.ast.length) {
+			return null
+		}
+
+		const tok = this.ast[this.pos]
+		this.pos++
+		return tok
+	}
+
+	backup() {
+		this.pos = Math.max(0, this.pos - 1)
 	}
 
 	accepts(Type, val) {
 		const tok = this.next()
+
+		if (!tok) {
+			return false
+		}
+
 		if (tok.tt != Type || val !== undefined && tok.raw != val) {
 			this.backup()
 			return false
@@ -66,20 +90,28 @@ class parser {
 		return true
 	}
 
-	number() {
-		let tok = this.next()
-		let sum = 0
-		let initialized = false
+	consume(Type) {
+		for (; this.accepts(Type););
+	}
+
+	numeric() {
+		let res = 0
+		let ok = false
 		let val
 
 		loop:
 		for (; ;) {
+			const tok = this.next()
+
+			if (!tok) {
+				break
+			}
+
 			switch (tok.tt) {
 				case tokenType.Number:
-					sum += Number(tok.raw)
-					initialized = true
+					res += Number(tok.raw)
+					ok = true
 					break
-
 				case tokenType.Word:
 					val = numericTable[tok.raw]
 					if (!val) {
@@ -87,62 +119,158 @@ class parser {
 						break
 					}
 
-					sum += Number(val.n)
-					initialized = true
+					res += Number(val.n)
+					ok = true
 
 					if (val.multipart) {
 						this.consume(tokenType.Blank)
-						tok = this.next()
 						continue loop
 					}
 					break
+				default:
+					this.backup()
 			}
-			break
+
+			break // loops multiple times only for multipart numberics
 		}
 
-		return initialized ? sum : null
-	}
-
-	next() {
-		if (this.ast.length <= this.pos) {
-			return null
-		}
-
-		const res = this.ast[this.pos]
-		this.pos++
-		return res
-	}
-
-	backup() {
-		this.pos--
+		return ok ? res : null
 	}
 }
 
+const stateHead = (p) => {
+	p.consume(tokenType.Blank)
 
-const stateBegin = (p) => {
+	const num = p.numeric()
+
+	if (num !== null) {
+		p.numbers.push(num)
+		return stateAfterFirstNumber
+	}
+
+	if (p.accepts(tokenType.Word, 'четверть') || p.accepts(tokenType.Word, 'четверти')) {
+		p.invert = true
+		p.numbers.push(15)
+		return stateAcceptHours
+	}
+
 	if (p.accepts(tokenType.Word, 'без')) {
 		p.invert = true
-		return stateBegin
+		p.neg = true
+		return stateHead
 	}
 
-	const n = p.number()
-
-	if (n !== null) {
-		p.numbers.push(n)
-
-		if (p.accepts(tokenType.Blank, ':') || p.accepts(tokenType.Blank, '.')) {
-			return stateMinutes
-		}
+	if (p.accepts(tokenType.Word, 'пол') || p.accepts(tokenType.Word, 'половина')) {
+		p.invert = true
+		p.numbers.push(30)
+		return stateAcceptHours
 	}
 }
 
-const stateMinutes = (p) => {
-	const n = p.number()
+const stateAfterFirstNumber = (p) => {
+	p.consume(tokenType.Blank)
 
-	if (n === null) {
-		p.err = new Error(`parse error: given ${p.next()}, want: numeric`)
+	const num = p.numeric()
+
+	if (num !== null) {
+		p.numbers.push(num)
 	}
-	p.numbers.push(n)
+
+	if (p.accepts(tokenType.Word, 'четверти')) {
+		let n = p.numbers.pop()
+		if (!n) {
+			n = 1
+		}
+
+		if (!p.numbers.length) {
+			p.invert = true
+		}
+
+		p.numbers.push(n * 15)
+		return stateAcceptHours
+	}
+
+	if (num !== null) {
+		return stateAcceptAttributes
+	}
+
+	if (p.accepts(tokenType.Word, 'минут') || p.accepts(tokenType.Word, 'минуты')) {
+		p.invert = true
+		return stateAcceptHours
+	}
+
+	if (p.accepts(tokenType.Word, 'час') || p.accepts(tokenType.Word, 'часа') || p.accepts(tokenType.Word, 'часов')) {
+		return stateAcceptMinutes
+	}
+
+	// try parse incomplete forms
+	return stateAcceptAttributes
+}
+
+const stateAcceptHours = (p) => {
+	p.consume(tokenType.Blank)
+
+	const num = p.numeric()
+
+	if (num !== null) {
+		p.numbers.push(num)
+
+		p.consume(tokenType.Blank)
+		p.accepts(tokenType.Word, 'час')
+		p.accepts(tokenType.Word, 'часа')
+		p.accepts(tokenType.Word, 'часов')
+
+		return stateAcceptAttributes
+	}
+}
+
+const stateAcceptMinutes = (p) => {
+	p.consume(tokenType.Blank)
+
+	const num = p.numeric()
+
+	if (num !== null) {
+		p.numbers.push(num)
+
+		p.consume(tokenType.Blank)
+		p.accepts(tokenType.Word, 'минут')
+		p.accepts(tokenType.Word, 'минуты')
+
+		return stateAcceptAttributes
+	}
+}
+
+const stateAcceptAttributes = (p) => {
+	p.consume(tokenType.Blank)
+
+	const i = p.invert ? 1 : 0
+	const hours = p.numbers[i]
+
+	if (p.accepts(tokenType.Word, 'утра')) {
+		// no-op
+		return
+	}
+
+	if (p.accepts(tokenType.Word, 'дня')) {
+		if (hours > 0 && hours < 12) {
+			p.numbers[i] += 12
+		}
+		return
+	}
+
+	if (p.accepts(tokenType.Word, 'вечера')) {
+		if (hours > 0 && hours <= 12) {
+			p.numbers[i] += 12
+		}
+		return
+	}
+
+	if (p.accepts(tokenType.Word, 'ночи')) {
+		if (hours > 8 && hours <= 12) {
+			p.numbers[i] += 12
+		}
+		return
+	}
 }
 
 const tokenType = {
@@ -194,8 +322,6 @@ const numericTable = {}
 	;
 (() => {
 	[
-		{ n: -30, t: 'пол,половина' },
-		{ n: 15, t: 'четверти,четверть' },
 		{ n: 1, t: 'одна,один,первая,первый,первого' },
 		{ n: 2, t: 'две,два,второй,вторая,второго' },
 		{ n: 3, t: 'третья,третий,три,третьего' },
